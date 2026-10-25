@@ -3,6 +3,7 @@ import { Customer, TranscriptItem, ToolExecution } from '../types/banking.ts';
 import { AudioRecorder, GaplessAudioPlayer } from '../utils/audioUtils.ts';
 import { AudioVisualizer } from './AudioVisualizer.tsx';
 import { formatDuration } from '../utils/formatters.ts';
+import { BrowserVoiceSession } from '../utils/browserVoiceSession.ts';
 import {
   Phone,
   PhoneOff,
@@ -65,7 +66,8 @@ export const VoiceSimulator: React.FC<VoiceSimulatorProps> = ({
   const [copiedOtp, setCopiedOtp] = useState<boolean>(false);
 
   // References for WebAudio and WebSocket
-  const wsRef = useRef<WebSocket | null>(null);
+  const wsRef = useRef<WebSocket | BrowserVoiceSession | null>(null);
+  const speechRecRef = useRef<any>(null);
   const recorderRef = useRef<AudioRecorder | null>(null);
   const playerRef = useRef<GaplessAudioPlayer | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
@@ -157,13 +159,19 @@ export const VoiceSimulator: React.FC<VoiceSimulatorProps> = ({
         }),
       });
 
-      // 3. Establish WebSocket connection to backend Gemini Live Bridge
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/api/live?callId=${newCallId}&caller=${encodeURIComponent(
-        customerPhone
-      )}&customerId=${currentCustomer?.id || ''}`;
+      // 3. Establish WebSocket connection to backend Gemini Live Bridge (or BrowserVoiceSession for GitHub Pages)
+      const isGitHubPages = typeof window !== 'undefined' && window.location.hostname.includes('github.io');
+      let ws: any;
 
-      const ws = new WebSocket(wsUrl);
+      if (isGitHubPages) {
+        ws = new BrowserVoiceSession(newCallId, customerPhone, currentCustomer?.id);
+      } else {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/api/live?callId=${newCallId}&caller=${encodeURIComponent(
+          customerPhone
+        )}&customerId=${currentCustomer?.id || ''}`;
+        ws = new WebSocket(wsUrl);
+      }
       wsRef.current = ws;
 
       ws.onopen = async () => {
@@ -173,7 +181,7 @@ export const VoiceSimulator: React.FC<VoiceSimulatorProps> = ({
           await recorder.start(
             // On audio chunk (16kHz PCM LE base64)
             (base64Audio) => {
-              if (ws.readyState === WebSocket.OPEN && !isMuted) {
+              if (ws.readyState === 1 && !isMuted) {
                 ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
               }
             },
@@ -184,6 +192,9 @@ export const VoiceSimulator: React.FC<VoiceSimulatorProps> = ({
                 // Customer started speaking: Barge-in / Interruption handling!
                 if (playerRef.current) {
                   playerRef.current.stopAndClearQueue();
+                }
+                if ('speechSynthesis' in window) {
+                  window.speechSynthesis.cancel();
                 }
                 setIsAgentSpeaking(false);
               }
@@ -201,6 +212,30 @@ export const VoiceSimulator: React.FC<VoiceSimulatorProps> = ({
 
           recorderRef.current = recorder;
           setCallState('ACTIVE');
+
+          // If on GitHub Pages, also listen with Web Speech API for hands-free speech recognition
+          if (isGitHubPages && typeof window !== 'undefined') {
+            const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+            if (SpeechRec) {
+              try {
+                const rec = new SpeechRec();
+                rec.continuous = true;
+                rec.interimResults = false;
+                rec.lang = currentCustomer?.preferredLanguage === 'Hindi' ? 'hi-IN' : 'en-IN';
+                rec.onresult = (e: any) => {
+                  const lastIdx = e.results.length - 1;
+                  const spokenText = e.results[lastIdx][0]?.transcript;
+                  if (spokenText) {
+                    triggerSimulatedSpeech(spokenText.trim());
+                  }
+                };
+                rec.start();
+                speechRecRef.current = rec;
+              } catch (e) {
+                console.warn('SpeechRecognition error:', e);
+              }
+            }
+          }
 
           // Initial greeting transcript
           setTranscripts([
@@ -220,7 +255,7 @@ export const VoiceSimulator: React.FC<VoiceSimulatorProps> = ({
         }
       };
 
-      ws.onmessage = (event) => {
+      ws.onmessage = (event: any) => {
         try {
           const msg = JSON.parse(event.data);
 
@@ -230,6 +265,9 @@ export const VoiceSimulator: React.FC<VoiceSimulatorProps> = ({
           } else if (msg.type === 'interrupted') {
             // Server detected customer barge-in
             playerRef.current?.stopAndClearQueue();
+            if ('speechSynthesis' in window) {
+              window.speechSynthesis.cancel();
+            }
             setIsAgentSpeaking(false);
           } else if (msg.type === 'transcript') {
             setIsProcessing(false);
@@ -273,8 +311,16 @@ export const VoiceSimulator: React.FC<VoiceSimulatorProps> = ({
         }
       };
 
-      ws.onerror = (e) => {
-        console.error('WebSocket error:', e);
+      ws.onerror = (e: any) => {
+        console.warn('WebSocket error, falling back if possible:', e);
+        if (!isGitHubPages && ws instanceof WebSocket) {
+          const fallback = new BrowserVoiceSession(newCallId, customerPhone, currentCustomer?.id);
+          fallback.onmessage = ws.onmessage;
+          fallback.onclose = ws.onclose;
+          fallback.onerror = ws.onerror;
+          wsRef.current = fallback;
+          return;
+        }
         setErrorMessage('Voice connection encountered an error.');
       };
 
@@ -293,21 +339,30 @@ export const VoiceSimulator: React.FC<VoiceSimulatorProps> = ({
 
   // End voice call & clean up streams
   const endCall = async () => {
-    // 1. Stop recorder
+    // 1. Stop recorder and speech recognition
     if (recorderRef.current) {
       recorderRef.current.stop();
       recorderRef.current = null;
     }
+    if (speechRecRef.current) {
+      try {
+        speechRecRef.current.stop();
+      } catch {}
+      speechRecRef.current = null;
+    }
 
-    // 2. Stop audio player
+    // 2. Stop audio player and cancel speech synthesis
     if (playerRef.current) {
       playerRef.current.close();
       playerRef.current = null;
     }
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
 
     // 3. Close WebSocket
     if (wsRef.current) {
-      if (wsRef.current.readyState === WebSocket.OPEN) {
+      if (wsRef.current.readyState === 1) {
         wsRef.current.send(JSON.stringify({ type: 'end_call' }));
       }
       wsRef.current.close();
