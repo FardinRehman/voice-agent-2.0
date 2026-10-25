@@ -1,0 +1,6 @@
+{
+  "name": "XYZ Bank AI Voice Agent",
+  "description": "Enterprise hands-free AI voice banking customer support platform featuring Ananya, real-time voice activity detection, natural turn-taking, and banking workflows.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
